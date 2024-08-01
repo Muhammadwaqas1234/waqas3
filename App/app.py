@@ -18,17 +18,109 @@ from flask_mail import Mail, Message
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY")
 
+# Initialize DynamoDB resources
 dynamodb = boto3.resource('dynamodb', region_name='ap-southeast-2')
 dynamodb_client = boto3.client('dynamodb', region_name='ap-southeast-2')
 
+# Create or get reference to the DynamoDB tables
+def create_dynamodb_table(table_name, key_schema, attribute_definitions, provisioned_throughput, global_secondary_indexes=None):
+    try:
+        table_params = {
+            'TableName': table_name,
+            'KeySchema': key_schema,
+            'AttributeDefinitions': attribute_definitions,
+            'ProvisionedThroughput': provisioned_throughput
+        }
+        if global_secondary_indexes:
+            table_params['GlobalSecondaryIndexes'] = global_secondary_indexes
+
+        table = dynamodb.create_table(**table_params)
+        table.meta.client.get_waiter('table_exists').wait(TableName=table_name)
+        print(f"Table {table_name} created successfully.")
+    except dynamodb_client.exceptions.ResourceInUseException:
+        print(f"Table {table_name} already exists.")
+
+# Example table creation
+create_dynamodb_table(
+    'Users',
+    key_schema=[
+        {'AttributeName': 'id', 'KeyType': 'HASH'}
+    ],
+    attribute_definitions=[
+        {'AttributeName': 'id', 'AttributeType': 'S'},
+        {'AttributeName': 'email', 'AttributeType': 'S'}
+    ],
+    provisioned_throughput={
+        'ReadCapacityUnits': 10,
+        'WriteCapacityUnits': 10
+    },
+    global_secondary_indexes=[
+        {
+            'IndexName': 'email-index',
+            'KeySchema': [
+                {'AttributeName': 'email', 'KeyType': 'HASH'}
+            ],
+            'Projection': {
+                'ProjectionType': 'ALL'
+            },
+            'ProvisionedThroughput': {
+                'ReadCapacityUnits': 10,
+                'WriteCapacityUnits': 10
+            }
+        }
+    ]
+)
+
+create_dynamodb_table(
+    'ChatHistory',
+    key_schema=[
+        {'AttributeName': 'user_id', 'KeyType': 'HASH'},
+        {'AttributeName': 'timestamp', 'KeyType': 'RANGE'}
+    ],
+    attribute_definitions=[
+        {'AttributeName': 'user_id', 'AttributeType': 'S'},
+        {'AttributeName': 'timestamp', 'AttributeType': 'S'}
+    ],
+    provisioned_throughput={
+        'ReadCapacityUnits': 10,
+        'WriteCapacityUnits': 10
+    }
+)
+
+create_dynamodb_table(
+    'Feedback',
+    key_schema=[
+        {'AttributeName': 'user_id', 'KeyType': 'HASH'},
+        {'AttributeName': 'timestamp', 'KeyType': 'RANGE'}
+    ],
+    attribute_definitions=[
+        {'AttributeName': 'user_id', 'AttributeType': 'S'},
+        {'AttributeName': 'timestamp', 'AttributeType': 'S'}
+    ],
+    provisioned_throughput={
+        'ReadCapacityUnits': 10,
+        'WriteCapacityUnits': 10
+    }
+)
+
+# DynamoDB table references
+users_table = dynamodb.Table('Users')
+chat_history_table = dynamodb.Table('ChatHistory')
+feedback_table = dynamodb.Table('Feedback')
+pdf_content_table = dynamodb.Table('PDFContentTable')  # Add your table reference here
+
 openai.api_key = os.getenv("OPENAI_API_KEY")
 messages = []
+
+# Flask mail configuration
 app.config['MAIL_SERVER'] = 'smtp.gmail.com'
 app.config['MAIL_PORT'] = 587
 app.config['MAIL_USE_TLS'] = True
 app.config['MAIL_USERNAME'] = 'helpscai@gmail.com'
 app.config['MAIL_PASSWORD'] = 'qihtnzfigqpjbjfm'
 app.config['MAIL_DEFAULT_SENDER'] = 'helpscai@gmail.com'
+
+# API and Stripe keys
 openai_api_key = os.getenv('OPENAI_API_KEY')
 stripe_secret_key = os.getenv('STRIPE_SECRET_KEY')
 stripe_public_key = os.getenv('STRIPE_PUBLIC_KEY')
@@ -36,47 +128,32 @@ stripe_price_id = os.getenv('STRIPE_PRICE_ID')
 stripe_webhook_secret = os.getenv('STRIPE_WEBHOOK_SECRET')
 mail = Mail(app)
 
-
-users_table = dynamodb.Table('Users')
-chat_history_table = dynamodb.Table('ChatHistory')
-feedback_table = dynamodb.Table('Feedback')
-data_table = dynamodb.Table('Data')
-
 def appendMessage(role, message, type='message'):
     messages.append({"role": role, "content": message, "type": type})
 
-def fetch_data_from_dynamodb(category, subcategory):
-    response = data_table.query(
-        IndexName='category-index', 
-        KeyConditionExpression=Key('category').eq(category)
-    )
-    items = response['Items']
-    if not items:
-        return []
-
-    filtered_items = [item for item in items if item['subcategory'] == subcategory]
-    return filtered_items
-
-def load_data(category, subcategory):
-    data_items = fetch_data_from_dynamodb(category, subcategory)
-    documents = [item['content'] for item in data_items]
+# Load data from DynamoDB instead of directory
+def load_data_from_dynamodb():
+    response = pdf_content_table.scan()
+    documents = response.get('Items', [])
     
-    llm = OpenAI(model="gpt-3.5-turbo", temperature="0.1", systemprompt="""Use the data from DynamoDB as source for the answer. Generate a valid 
-                 and relevant answer to a query related to 
-                 construction problems, ensure the answer is based strictly on the content of 
-                 the data and not influenced by other sources. Do not hallucinate. The answer should 
+    text_documents = [doc['text'] for doc in documents if 'text' in doc]
+
+    llm = OpenAI(model="gpt-3.5-turbo", temperature="0.1", systemprompt="""Use the books in the database as a source for the answer. Generate a valid
+                 and relevant answer to a query related to
+                 construction problems, ensure the answer is based strictly on the content of
+                 the book and not influenced by other sources. Do not hallucinate. The answer should
                  be informative and fact-based. """)
     service_content = ServiceContext.from_defaults(llm=llm)
-    index = VectorStoreIndex.from_documents(documents, service_context=service_content)
+    index = VectorStoreIndex.from_documents(text_documents, service_context=service_content)
     return index
 
+# Query the chatbot using the loaded index
 def query_chatbot(query_engine, user_question):
     response = query_engine.query(user_question)
     return response.response if response else None
 
-def initialize_chatbot(category, subcategory, model="gpt-3.5-turbo", temperature=0.4):
-    data_items = fetch_data_from_dynamodb(category, subcategory)
-    documents = [item['content'] for item in data_items]
+def initialize_chatbot(model="gpt-3.5-turbo", temperature=0.4):
+    documents = load_data_from_dynamodb()
     llm = OpenAI(model=model, temperature=temperature)
 
     additional_questions_prompt_str = (
@@ -133,12 +210,7 @@ def generate_response(user_question):
     user = response.get('Item')
     user_language = user.get('language', 'en') if user else 'en'
 
-    # Identify relevant category and subcategory
-    # This part needs to be customized based on how you identify the category and subcategory from the question
-    category = "your_category"  # Replace with logic to identify category from question
-    subcategory = "your_subcategory"  # Replace with logic to identify subcategory from question
-
-    index = load_data(category, subcategory)
+    index = load_data_from_dynamodb()
     chat_engine = index.as_chat_engine(chat_mode="condense_question", verbose=True)
 
     response = chat_engine.chat(user_question)
@@ -151,7 +223,7 @@ def generate_response(user_question):
         with open('output.wav', 'rb') as audio_file:
             audio_data = base64.b64encode(audio_file.read()).decode('utf-8')
 
-        additional_questions = generate_additional_questions(user_question)
+        additional_questions = generate_additional_questions(response_text)
         document_session = response_text
 
         return response_text, additional_questions, audio_data, document_session
@@ -198,8 +270,8 @@ def chat():
         appendMessage('assistant', response_text, type='response')
 
         session_id = str(uuid.uuid4())
-        session_name = ' '.join(user_question.split()[:4])  
-        timestamp = datetime.utcnow().isoformat()  
+        session_name = ' '.join(user_question.split()[:4])
+        timestamp = datetime.utcnow().isoformat()
         chat_history_table.put_item(
             Item={
                 "session_id": session_id,
@@ -207,7 +279,7 @@ def chat():
                 "session_name": session_name,
                 "start_time": timestamp,
                 "chat_history": messages,
-                "timestamp": timestamp  
+                "timestamp": timestamp
             }
         )
 
@@ -238,7 +310,7 @@ def history():
     user_id = session['user_id']
     response = chat_history_table.query(
         KeyConditionExpression=Key('user_id').eq(user_id),
-        ScanIndexForward=False  
+        ScanIndexForward=False
     )
     items = response['Items']
     chat_history = []
@@ -251,6 +323,7 @@ def history():
         })
 
     return render_template("history.html", chat_history=chat_history)
+
 
 @app.route('/send-email', methods=['POST'])
 def send_email():
